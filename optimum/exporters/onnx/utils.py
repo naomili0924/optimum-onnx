@@ -454,23 +454,83 @@ def _get_submodels_and_tensors_(
     inf_kwargs: dict[str, Any] | None = None,
     skip_random_generation: bool = False,
 ):
-    from transformers import PreTrainedModel    
+    from transformers import PreTrainedModel
     if isinstance(model, PreTrainedModel):
         dummy_inputs = {"transformer": {}}
-        dummy_outputs = {}
-        hooks = []
-        for key, value in inf_kwargs.items():
-            if skip_random_generation is True:
-                dummy_inputs["transformer"][key] = value
-            else:
-                dummy_inputs["transformer"][key] = tuple(value.shape)
-        hooks.append(
-            model.register_forward_hook(make_dataclass_output_hook(dummy_outputs, "transformer")))
+        dummy_outputs = {"transformer": {}}
 
-        output = model(**inf_kwargs)
-        for h in hooks:
-            h.remove()
-        return dummy_inputs,dummy_outputs
+        # Add position_ids derived from input_ids if not already present
+        prefill_kwargs = dict(inf_kwargs)
+        if "position_ids" not in prefill_kwargs and "input_ids" in prefill_kwargs:
+            input_ids = prefill_kwargs["input_ids"]
+            batch_size, seq_len = input_ids.shape
+            prefill_kwargs["position_ids"] = torch.arange(
+                seq_len, dtype=torch.long
+            ).unsqueeze(0).expand(batch_size, -1)
+
+        # Prefill forward: no past_key_values, traces all input shapes
+        with torch.no_grad():
+            prefill_output = model(**prefill_kwargs)
+
+        past_key_values = getattr(prefill_output, "past_key_values", None)
+
+        if past_key_values is not None and len(past_key_values) > 0:
+            # --- Decode step: trace "with past" scenario ---
+            input_ids = prefill_kwargs["input_ids"]
+            batch_size, seq_len = input_ids.shape
+
+            # Single new token
+            new_token = torch.zeros((batch_size, 1), dtype=input_ids.dtype)
+            # Extended attention mask (original seq + 1 new token)
+            new_attn_mask = torch.ones((batch_size, seq_len + 1), dtype=torch.long)
+            # Position of the new token
+            new_pos_ids = torch.full((batch_size, 1), seq_len, dtype=torch.long)
+
+            decode_kwargs = {
+                "input_ids": new_token,
+                "attention_mask": new_attn_mask,
+                "position_ids": new_pos_ids,
+                "past_key_values": past_key_values,
+            }
+
+            with torch.no_grad():
+                decode_output = model(**decode_kwargs)
+
+            def _store(d, key, val):
+                d[key] = val if skip_random_generation else tuple(val.shape)
+
+            # Record flat tensor inputs (not past_key_values yet)
+            for key, val in decode_kwargs.items():
+                if torch.is_tensor(val):
+                    _store(dummy_inputs["transformer"], key, val)
+
+            # Flatten past_key_values into named inputs
+            for i, (k, v) in enumerate(decode_kwargs["past_key_values"]):
+                _store(dummy_inputs["transformer"], f"past_key_values.{i}.key", k)
+                _store(dummy_inputs["transformer"], f"past_key_values.{i}.value", v)
+
+            # Record outputs
+            if getattr(decode_output, "logits", None) is not None:
+                dummy_outputs["transformer"]["logits"] = tuple(decode_output.logits.shape)
+            updated_pkv = getattr(decode_output, "past_key_values", None)
+            if updated_pkv is not None:
+                for i, (k, v) in enumerate(updated_pkv):
+                    dummy_outputs["transformer"][f"past_key_values.{i}.key"] = tuple(k.shape)
+                    dummy_outputs["transformer"][f"past_key_values.{i}.value"] = tuple(v.shape)
+        else:
+            # No KV cache: original single-step behaviour + position_ids
+            for key, val in prefill_kwargs.items():
+                dummy_inputs["transformer"][key] = (
+                    val if skip_random_generation else tuple(val.shape)
+                )
+            hooks = [model.register_forward_hook(
+                make_dataclass_output_hook(dummy_outputs, "transformer")
+            )]
+            model(**prefill_kwargs)
+            for h in hooks:
+                h.remove()
+
+        return dummy_inputs, dummy_outputs
         
         
     import torch.nn as nn

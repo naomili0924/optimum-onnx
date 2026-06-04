@@ -675,7 +675,8 @@ def export_pytorch(
 
             print("here ", dummy_inputs.keys())
             for key, value in dummy_inputs.items():
-                print(key, value.shape)
+                shape = tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+                print(key, shape)
             print("here ", input_names)
             print("here ", output_names)
 
